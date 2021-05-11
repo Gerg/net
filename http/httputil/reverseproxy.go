@@ -12,11 +12,12 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gerg/net/http"
 
 	"golang.org/x/net/http/httpguts"
 )

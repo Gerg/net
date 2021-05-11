@@ -12,7 +12,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net"
-	"net/http"
+	"github.com/gerg/net/http"
 	"net/url"
 	"strings"
 	"time"

@@ -20,7 +20,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http/httptrace"
 	"net/textproto"
 	"net/url"
 	"os"
@@ -29,6 +28,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gerg/net/http/httptrace"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http/httpproxy"
