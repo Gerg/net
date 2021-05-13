@@ -230,6 +230,8 @@ type Transport struct {
 	// automatically.
 	TLSNextProto map[string]func(authority string, c *tls.Conn) RoundTripper
 
+	// ProtoUpgrade func(authority string, c *tls.Conn) RoundTripper
+
 	// ProxyConnectHeader optionally specifies headers to send to
 	// proxies during CONNECT requests.
 	ProxyConnectHeader Header
@@ -326,6 +328,7 @@ type h2Transport interface {
 // onceSetNextProtoDefaults initializes TLSNextProto.
 // It must be called via t.nextProtoOnce.Do.
 func (t *Transport) onceSetNextProtoDefaults() {
+	fmt.Println("Once, considering whether to set up HTTP/2 transport! Hmm......")
 	t.tlsNextProtoWasNil = (t.TLSNextProto == nil)
 	if strings.Contains(os.Getenv("GODEBUG"), "http2client=0") {
 		return
@@ -360,6 +363,7 @@ func (t *Transport) onceSetNextProtoDefaults() {
 		// However, if ForceAttemptHTTP2 is true, it overrides the above checks.
 		return
 	}
+	fmt.Println("Configuring HTTP/2 transport!")
 	t2, err := http2configureTransport(t)
 	if err != nil {
 		log.Printf("Error enabling Transport HTTP/2 support: %v", err)
@@ -453,6 +457,7 @@ func (t *Transport) useRegisteredProtocol(req *Request) bool {
 
 // roundTrip implements a RoundTripper over HTTP.
 func (t *Transport) roundTrip(req *Request) (*Response, error) {
+	fmt.Println("!!!!! Golang successfully modified. Alert the authority. !!!!!!")
 	t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
 	ctx := req.Context()
 	trace := httptrace.ContextClientTrace(ctx)
@@ -534,6 +539,26 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 			resp, err = pconn.alt.RoundTrip(req)
 		} else {
 			resp, err = pconn.roundTrip(treq)
+			fmt.Println("HTTP/1 request returned from its round trip")
+
+			if resp.StatusCode == StatusSwitchingProtocols {
+				fmt.Println("Switching protocols, here goes nothing!")
+				// TODO(gerg): Just because we are switching protocol doesn't mean we are going to h2c
+				// don't forget websockets
+				// TODO(gerg): TLSNextProto might not have a "h2c" key
+				h2cUpgrade := t.TLSNextProto["h2c"]
+				conn := pconn.conn.(*tls.Conn)
+				authority := cm.targetAddr
+				// TODO(gerg): We now have a pconn that has an alt defined (to a http2.Transport) AND
+				// it is running a readloop (unless it was terminated already as part of processing the 101?)
+				// are we going to run into issues with them fighting over the connection?
+				// Good news is the pconn readLoop seems to handle the 101 case as terminal and intentionally
+				// leaves the connection open for reading/writing in the upgraded protocol
+				pconn.alt = h2cUpgrade(authority, conn) // fn defined in h2_bundle http2configureTransport
+				fmt.Println("Upgraded connection to HTTP/2, now to read the response...")
+				resp, err = pconn.alt.RoundTrip(req) // pconn.alt is t3 which is a http2.PremiumRoundTripper
+				fmt.Println("We did it! HTTP/2 response recovered!")
+			}
 		}
 		if err == nil {
 			return resp, nil
@@ -2139,6 +2164,8 @@ func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTr
 		break
 	}
 	if resp.isProtocolSwitch() {
+		// TODO(gerg): This might be an interesting place to put some upgrade logic
+
 		resp.Body = newReadWriteCloserBody(pc.br, pc.conn)
 	}
 

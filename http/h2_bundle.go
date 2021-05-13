@@ -816,6 +816,36 @@ func (c *http2dialCall) dial(addr string) {
 	c.p.mu.Unlock()
 }
 
+// TODO(greg): This is basically a copy of addConnIfNeeded, can it be merged back in?
+func (p *http2clientConnPool) upgradeHttp1Conn(key string, t *http2Transport, c *tls.Conn) (used bool, err error) {
+	p.mu.Lock()
+	for _, cc := range p.conns[key] {
+		if cc.CanTakeNewRequest() {
+			p.mu.Unlock()
+			return false, nil
+		}
+	}
+	call, dup := p.addConnCalls[key]
+	if !dup {
+		if p.addConnCalls == nil {
+			p.addConnCalls = make(map[string]*http2addConnCall)
+		}
+		call = &http2addConnCall{
+			p:    p,
+			done: make(chan struct{}),
+		}
+		p.addConnCalls[key] = call
+		go call.run(t, key, c, true)
+	}
+	p.mu.Unlock()
+
+	<-call.done
+	if call.err != nil {
+		return false, call.err
+	}
+	return !dup, nil
+}
+
 // addConnIfNeeded makes a NewClientConn out of c if a connection for key doesn't
 // already exist. It coalesces concurrent calls with the same key.
 // This is used by the http1 Transport code when it creates a new connection. Because
@@ -842,7 +872,7 @@ func (p *http2clientConnPool) addConnIfNeeded(key string, t *http2Transport, c *
 			done: make(chan struct{}),
 		}
 		p.addConnCalls[key] = call
-		go call.run(t, key, c)
+		go call.run(t, key, c, false)
 	}
 	p.mu.Unlock()
 
@@ -859,8 +889,15 @@ type http2addConnCall struct {
 	err  error
 }
 
-func (c *http2addConnCall) run(t *http2Transport, key string, tc *tls.Conn) {
-	cc, err := t.NewClientConn(tc)
+func (c *http2addConnCall) run(t *http2Transport, key string, tc *tls.Conn, createStreamPlz bool) {
+	var cc *http2ClientConn
+	var err error
+
+	if createStreamPlz {
+		cc, err = t.NewClientConnWithStream(tc)
+	} else {
+		cc, err = t.NewClientConn(tc)
+	}
 
 	p := c.p
 	p.mu.Lock()
@@ -6626,6 +6663,14 @@ func http2ConfigureTransport(t1 *Transport) error {
 	return err
 }
 
+type PremiumRoundTripper struct {
+	t2 *http2Transport
+}
+
+func (t3 *PremiumRoundTripper) RoundTrip(req *Request) (*Response, error) {
+	return t3.t2.CompleteUpgrade(req)
+}
+
 func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 	connPool := new(http2clientConnPool)
 	t2 := &http2Transport{
@@ -6645,7 +6690,7 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 	if !http2strSliceContains(t1.TLSClientConfig.NextProtos, "http/1.1") {
 		t1.TLSClientConfig.NextProtos = append(t1.TLSClientConfig.NextProtos, "http/1.1")
 	}
-	upgradeFn := func(authority string, c *tls.Conn) RoundTripper {
+	alpnUpgradeFn := func(authority string, c *tls.Conn) RoundTripper {
 		addr := http2authorityAddr("https", authority)
 		if used, err := connPool.addConnIfNeeded(addr, t2, c); err != nil {
 			go c.Close()
@@ -6659,13 +6704,36 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 		}
 		return t2
 	}
+	h2cUpgradeFn := func(authority string, c *tls.Conn) RoundTripper {
+		fmt.Println("Upgrading to h2c via h2cUpgradeFn")
+		addr := http2authorityAddr("https", authority)
+		if used, err := connPool.upgradeHttp1Conn(addr, t2, c); err != nil {
+			go c.Close()
+			return http2erringRoundTripper{err}
+		} else if !used {
+			// Turns out we don't need this c.
+			// For example, two goroutines made requests to the same host
+			// at the same time, both kicking off TCP dials. (since protocol
+			// was unknown)
+			go c.Close()
+		}
+		return &PremiumRoundTripper{t2: t2}
+	}
+
+	// TODO(gerg): Okay, this is cheating. "h2c" is not a valid ALPN protocol. If
+	// this was just called "NextProto" (sans TLS), then it might be more legit.
+	// We are doing this now as a convenience, but might need a different way to
+	// get this callback to t1.
 	if m := t1.TLSNextProto; len(m) == 0 {
 		t1.TLSNextProto = map[string]func(string, *tls.Conn) RoundTripper{
-			"h2": upgradeFn,
+			"h2":  alpnUpgradeFn,
+			"h2c": h2cUpgradeFn,
 		}
 	} else {
-		m["h2"] = upgradeFn
+		m["h2"] = alpnUpgradeFn
+		m["h2c"] = h2cUpgradeFn
 	}
+	fmt.Println("Registered the h2c upgrade function in t1.TLSNextProto")
 	return t2, nil
 }
 
@@ -6897,6 +6965,47 @@ func (t *http2Transport) RoundTrip(req *Request) (*Response, error) {
 	return t.RoundTripOpt(req, http2RoundTripOpt{})
 }
 
+// TODO(gerg): Borrowed content from RoundTripOpt
+// TODO(gerg): Does this name make any sense? 🤔
+func (t *http2Transport) CompleteUpgrade(req *Request) (*Response, error) {
+	if !(req.URL.Scheme == "https" || (req.URL.Scheme == "http" && t.AllowHTTP)) {
+		return nil, errors.New("http2: unsupported scheme")
+	}
+
+	addr := http2authorityAddr(req.URL.Scheme, req.URL.Host)
+	for retry := 0; ; retry++ {
+		cc, err := t.connPool().GetClientConn(req, addr)
+		if err != nil {
+			t.vlogf("http2: Transport failed to get client conn for %s: %v", addr, err)
+			return nil, err
+		}
+		reused := !atomic.CompareAndSwapUint32(&cc.reused, 0, 1)
+		http2traceGotConn(req, cc, reused)
+		res, gotErrAfterReqBodyWrite, err := cc.completeUpgrade(req)
+		if err != nil && retry <= 6 {
+			if req, err = http2shouldRetryRequest(req, err, gotErrAfterReqBodyWrite); err == nil {
+				// After the first retry, do exponential backoff with 10% jitter.
+				if retry == 0 {
+					continue
+				}
+				backoff := float64(uint(1) << (uint(retry) - 1))
+				backoff += backoff * (0.1 * mathrand.Float64())
+				select {
+				case <-time.After(time.Second * time.Duration(backoff)):
+					continue
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				}
+			}
+		}
+		if err != nil {
+			t.vlogf("CompleteUpgrade failure: %v", err)
+			return nil, err
+		}
+		return res, nil
+	}
+}
+
 // authorityAddr returns a given authority (a host/IP, or host:port / ip:port)
 // and returns a host:port. The port 443 is added if needed.
 func http2authorityAddr(scheme string, authority string) (addr string) {
@@ -7031,7 +7140,8 @@ func (t *http2Transport) dialClientConn(addr string, singleUse bool) (*http2Clie
 	if err != nil {
 		return nil, err
 	}
-	return t.newClientConn(tconn, singleUse)
+	// TODO(gerg): Just added false here to make it compile. Is that right?
+	return t.newClientConn(tconn, singleUse, false)
 }
 
 func (t *http2Transport) newTLSConfig(host string) *tls.Config {
@@ -7092,10 +7202,15 @@ func (t *http2Transport) expectContinueTimeout() time.Duration {
 }
 
 func (t *http2Transport) NewClientConn(c net.Conn) (*http2ClientConn, error) {
-	return t.newClientConn(c, false)
+	return t.newClientConn(c, false, false)
 }
 
-func (t *http2Transport) newClientConn(c net.Conn, singleUse bool) (*http2ClientConn, error) {
+// TODO(gerg): Do we want to add a new public method here?
+func (t *http2Transport) NewClientConnWithStream(c net.Conn) (*http2ClientConn, error) {
+	return t.newClientConn(c, false, true)
+}
+
+func (t *http2Transport) newClientConn(c net.Conn, singleUse bool, createStreamPlz bool) (*http2ClientConn, error) {
 	cc := &http2ClientConn{
 		t:                     t,
 		tconn:                 c,
@@ -7133,6 +7248,11 @@ func (t *http2Transport) newClientConn(c net.Conn, singleUse bool) (*http2Client
 	// henc in response to SETTINGS frames?
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
 
+	if createStreamPlz {
+		cc.newStream()
+	}
+	//TODO(greg): Do we need to trigger this to get the stream IDs correct? The stream that is
+	// created as part of the h2c upgrade should be stream ID 1
 	if t.AllowHTTP {
 		cc.nextStreamID = 3
 	}
@@ -7447,6 +7567,103 @@ func http2actualContentLength(req *Request) int64 {
 func (cc *http2ClientConn) RoundTrip(req *Request) (*Response, error) {
 	resp, _, err := cc.roundTrip(req)
 	return resp, err
+}
+
+// TODO(gerg): what is gotErrAfterReqBodyWrite used for? Do we need different
+// stream states to make this make sense to consumers?
+func (cc *http2ClientConn) completeUpgrade(req *Request) (res *Response, gotErrAfterReqBodyWrite bool, err error) {
+	var respHeaderTimer <-chan time.Time
+
+	cs := cc.streams[1]
+	//TODO(gerg): Setting the cs.req typically happens right as the stream is created
+	// we didn't have a handle on req at the time, so doing it here. Is there a better spot?
+	cs.req = req
+	cs.trace = httptrace.ContextClientTrace(req.Context())
+	readLoopResCh := cs.resc
+	// bodyWritten := false
+	ctx := req.Context()
+
+	handleReadLoopResponse := func(re http2resAndError) (*Response, bool, error) {
+		res := re.res
+		if re.err != nil || res.StatusCode > 299 {
+			// On error or status code 3xx, 4xx, 5xx, etc abort any
+			// ongoing write, assuming that the server doesn't care
+			// about our request body. If the server replied with 1xx or
+			// 2xx, however, then assume the server DOES potentially
+			// want our body (e.g. full-duplex streaming:
+			// golang.org/issue/13444). If it turns out the server
+			// doesn't, they'll RST_STREAM us soon enough. This is a
+			// heuristic to avoid adding knobs to Transport. Hopefully
+			// we can keep it.
+			// bodyWriter.cancel()
+			cs.abortRequestBodyWrite(http2errStopReqBodyWrite)
+		}
+		if re.err != nil {
+			cc.forgetStreamID(cs.ID)
+			return nil, cs.getStartedWrite(), re.err
+		}
+		res.Request = req
+		res.TLS = cc.tlsState
+		return res, false, nil
+	}
+
+	for {
+		select {
+		case re := <-readLoopResCh:
+			return handleReadLoopResponse(re)
+			// TODO(gerg): Understand what publishes to this channel
+		case <-respHeaderTimer:
+			// if !hasBody || bodyWritten {
+			cc.writeStreamReset(cs.ID, http2ErrCodeCancel, nil)
+			// } else {
+			// 	bodyWriter.cancel()
+			// 	cs.abortRequestBodyWrite(http2errStopReqBodyWriteAndCancel)
+			// }
+			cc.forgetStreamID(cs.ID)
+			return nil, cs.getStartedWrite(), http2errTimeout
+		case <-ctx.Done():
+			// if !hasBody || bodyWritten {
+			cc.writeStreamReset(cs.ID, http2ErrCodeCancel, nil)
+			// } else {
+			// bodyWriter.cancel()
+			// cs.abortRequestBodyWrite(http2errStopReqBodyWriteAndCancel)
+			// }
+			cc.forgetStreamID(cs.ID)
+			return nil, cs.getStartedWrite(), ctx.Err()
+		case <-req.Cancel:
+			// if !hasBody || bodyWritten {
+			cc.writeStreamReset(cs.ID, http2ErrCodeCancel, nil)
+			// } else {
+			// 	bodyWriter.cancel()
+			// 	cs.abortRequestBodyWrite(http2errStopReqBodyWriteAndCancel)
+			// }
+			cc.forgetStreamID(cs.ID)
+			return nil, cs.getStartedWrite(), http2errRequestCanceled
+		case <-cs.peerReset:
+			// processResetStream already removed the
+			// stream from the streams map; no need for
+			// forgetStreamID.
+			return nil, cs.getStartedWrite(), cs.resetErr
+			// TODO(gerg): Is it okay that we commented out this whole case?
+			// case err := <-bodyWriter.resc:
+			// 	// Prefer the read loop's response, if available. Issue 16102.
+			// 	select {
+			// 	case re := <-readLoopResCh:
+			// 		return handleReadLoopResponse(re)
+			// 	default:
+			// 	}
+			// 	if err != nil {
+			// 		cc.forgetStreamID(cs.ID)
+			// 		return nil, cs.getStartedWrite(), err
+			// 	}
+			// 	bodyWritten = true
+			// 	if d := cc.responseHeaderTimeout(); d != 0 {
+			// 		timer := time.NewTimer(d)
+			// 		defer timer.Stop()
+			// 		respHeaderTimer = timer.C
+			// 	}
+		}
+	}
 }
 
 func (cc *http2ClientConn) roundTrip(req *Request) (res *Response, gotErrAfterReqBodyWrite bool, err error) {
