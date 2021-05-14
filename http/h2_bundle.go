@@ -6697,10 +6697,6 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 		return t2
 	}
 
-	// TODO(gerg): Okay, this is cheating. "h2c" is not a valid ALPN protocol. If
-	// this was just called "NextProto" (sans TLS), then it might be more legit.
-	// We are doing this now as a convenience, but might need a different way to
-	// get this callback to t1.
 	if m := t1.TLSNextProto; len(m) == 0 {
 		t1.TLSNextProto = map[string]func(string, *tls.Conn) RoundTripper{
 			"h2": alpnUpgradeFn,
@@ -6947,45 +6943,21 @@ func (t *http2Transport) RoundTrip(req *Request) (*Response, error) {
 	return t.RoundTripOpt(req, http2RoundTripOpt{})
 }
 
-// TODO(gerg): Borrowed content from RoundTripOpt
-// TODO(gerg): Does this name make any sense? 🤔
 func (t *http2Transport) CompleteUpgrade(req *Request) (*Response, error) {
-	if !(req.URL.Scheme == "https" || (req.URL.Scheme == "http" && t.AllowHTTP)) {
-		return nil, errors.New("http2: unsupported scheme")
-	}
-
 	addr := http2authorityAddr(req.URL.Scheme, req.URL.Host)
-	for retry := 0; ; retry++ {
-		cc, err := t.connPool().GetClientConn(req, addr)
-		if err != nil {
-			t.vlogf("http2: Transport failed to get client conn for %s: %v", addr, err)
-			return nil, err
-		}
-		reused := !atomic.CompareAndSwapUint32(&cc.reused, 0, 1)
-		http2traceGotConn(req, cc, reused)
-		res, gotErrAfterReqBodyWrite, err := cc.completeUpgrade(req)
-		if err != nil && retry <= 6 {
-			if req, err = http2shouldRetryRequest(req, err, gotErrAfterReqBodyWrite); err == nil {
-				// After the first retry, do exponential backoff with 10% jitter.
-				if retry == 0 {
-					continue
-				}
-				backoff := float64(uint(1) << (uint(retry) - 1))
-				backoff += backoff * (0.1 * mathrand.Float64())
-				select {
-				case <-time.After(time.Second * time.Duration(backoff)):
-					continue
-				case <-req.Context().Done():
-					return nil, req.Context().Err()
-				}
-			}
-		}
-		if err != nil {
-			t.vlogf("CompleteUpgrade failure: %v", err)
-			return nil, err
-		}
-		return res, nil
+	cc, err := t.connPool().GetClientConn(req, addr)
+	if err != nil {
+		t.vlogf("http2: Transport failed to get client conn for %s: %v", addr, err)
+		return nil, err
 	}
+	reused := !atomic.CompareAndSwapUint32(&cc.reused, 0, 1)
+	http2traceGotConn(req, cc, reused)
+	res, err := cc.completeUpgrade(req)
+	if err != nil {
+		t.vlogf("CompleteUpgrade failure: %v", err)
+		return nil, err
+	}
+	return res, nil
 }
 
 // authorityAddr returns a given authority (a host/IP, or host:port / ip:port)
@@ -7551,101 +7523,23 @@ func (cc *http2ClientConn) RoundTrip(req *Request) (*Response, error) {
 	return resp, err
 }
 
-// TODO(gerg): what is gotErrAfterReqBodyWrite used for? Do we need different
-// stream states to make this make sense to consumers?
-func (cc *http2ClientConn) completeUpgrade(req *Request) (res *Response, gotErrAfterReqBodyWrite bool, err error) {
+func (cc *http2ClientConn) completeUpgrade(req *Request) (res *Response, err error) {
 	var respHeaderTimer <-chan time.Time
 
+	// TODO(gerg): Try and use a shared helper function with cc.roundTrip to prevent
+	// duplicate logic
 	cs := cc.streams[1]
-	//TODO(gerg): Setting the cs.req typically happens right as the stream is created
-	// we didn't have a handle on req at the time, so doing it here. Is there a better spot?
 	cs.req = req
 	cs.trace = httptrace.ContextClientTrace(req.Context())
-	readLoopResCh := cs.resc
-	// bodyWritten := false
-	ctx := req.Context()
+	//TODO(gerg): Is it okay that we have any empty one of these?
+	bodyWriter := http2bodyWriterState{}
 
-	handleReadLoopResponse := func(re http2resAndError) (*Response, bool, error) {
-		res := re.res
-		if re.err != nil || res.StatusCode > 299 {
-			// On error or status code 3xx, 4xx, 5xx, etc abort any
-			// ongoing write, assuming that the server doesn't care
-			// about our request body. If the server replied with 1xx or
-			// 2xx, however, then assume the server DOES potentially
-			// want our body (e.g. full-duplex streaming:
-			// golang.org/issue/13444). If it turns out the server
-			// doesn't, they'll RST_STREAM us soon enough. This is a
-			// heuristic to avoid adding knobs to Transport. Hopefully
-			// we can keep it.
-			// bodyWriter.cancel()
-			cs.abortRequestBodyWrite(http2errStopReqBodyWrite)
-		}
-		if re.err != nil {
-			cc.forgetStreamID(cs.ID)
-			return nil, cs.getStartedWrite(), re.err
-		}
-		res.Request = req
-		res.TLS = cc.tlsState
-		return res, false, nil
-	}
+	//TODO(gerg): Is it okay that we hard-code this to false?
+	hasBody := false
+	bodyWritten := true
 
-	for {
-		select {
-		case re := <-readLoopResCh:
-			return handleReadLoopResponse(re)
-			// TODO(gerg): Understand what publishes to this channel
-		case <-respHeaderTimer:
-			// if !hasBody || bodyWritten {
-			cc.writeStreamReset(cs.ID, http2ErrCodeCancel, nil)
-			// } else {
-			// 	bodyWriter.cancel()
-			// 	cs.abortRequestBodyWrite(http2errStopReqBodyWriteAndCancel)
-			// }
-			cc.forgetStreamID(cs.ID)
-			return nil, cs.getStartedWrite(), http2errTimeout
-		case <-ctx.Done():
-			// if !hasBody || bodyWritten {
-			cc.writeStreamReset(cs.ID, http2ErrCodeCancel, nil)
-			// } else {
-			// bodyWriter.cancel()
-			// cs.abortRequestBodyWrite(http2errStopReqBodyWriteAndCancel)
-			// }
-			cc.forgetStreamID(cs.ID)
-			return nil, cs.getStartedWrite(), ctx.Err()
-		case <-req.Cancel:
-			// if !hasBody || bodyWritten {
-			cc.writeStreamReset(cs.ID, http2ErrCodeCancel, nil)
-			// } else {
-			// 	bodyWriter.cancel()
-			// 	cs.abortRequestBodyWrite(http2errStopReqBodyWriteAndCancel)
-			// }
-			cc.forgetStreamID(cs.ID)
-			return nil, cs.getStartedWrite(), http2errRequestCanceled
-		case <-cs.peerReset:
-			// processResetStream already removed the
-			// stream from the streams map; no need for
-			// forgetStreamID.
-			return nil, cs.getStartedWrite(), cs.resetErr
-			// TODO(gerg): Is it okay that we commented out this whole case?
-			// case err := <-bodyWriter.resc:
-			// 	// Prefer the read loop's response, if available. Issue 16102.
-			// 	select {
-			// 	case re := <-readLoopResCh:
-			// 		return handleReadLoopResponse(re)
-			// 	default:
-			// 	}
-			// 	if err != nil {
-			// 		cc.forgetStreamID(cs.ID)
-			// 		return nil, cs.getStartedWrite(), err
-			// 	}
-			// 	bodyWritten = true
-			// 	if d := cc.responseHeaderTimeout(); d != 0 {
-			// 		timer := time.NewTimer(d)
-			// 		defer timer.Stop()
-			// 		respHeaderTimer = timer.C
-			// 	}
-		}
-	}
+	resp, _, err := cc.returnTrip(req, cs, bodyWriter, hasBody, respHeaderTimer, bodyWritten)
+	return resp, err
 }
 
 func (cc *http2ClientConn) roundTrip(req *Request) (res *Response, gotErrAfterReqBodyWrite bool, err error) {
@@ -7739,9 +7633,11 @@ func (cc *http2ClientConn) roundTrip(req *Request) (res *Response, gotErrAfterRe
 			respHeaderTimer = timer.C
 		}
 	}
+	return cc.returnTrip(req, cs, bodyWriter, hasBody, respHeaderTimer, false)
+}
 
+func (cc *http2ClientConn) returnTrip(req *Request, cs *http2clientStream, bodyWriter http2bodyWriterState, hasBody bool, respHeaderTimer <-chan time.Time, bodyWritten bool) (res *Response, gotErrAfterReqBodyWrite bool, err error) {
 	readLoopResCh := cs.resc
-	bodyWritten := false
 	ctx := req.Context()
 
 	handleReadLoopResponse := func(re http2resAndError) (*Response, bool, error) {
@@ -7772,6 +7668,7 @@ func (cc *http2ClientConn) roundTrip(req *Request) (res *Response, gotErrAfterRe
 		select {
 		case re := <-readLoopResCh:
 			return handleReadLoopResponse(re)
+			// TODO(gerg): Understand what publishes to this channel
 		case <-respHeaderTimer:
 			if !hasBody || bodyWritten {
 				cc.writeStreamReset(cs.ID, http2ErrCodeCancel, nil)
