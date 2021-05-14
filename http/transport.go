@@ -230,7 +230,8 @@ type Transport struct {
 	// automatically.
 	TLSNextProto map[string]func(authority string, c *tls.Conn) RoundTripper
 
-	// ProtoUpgrade func(authority string, c *tls.Conn) RoundTripper
+	// TODO(gerg): Consider this public interface change for Transport
+	UpgradeNextProto map[string]func(string, *tls.Conn) UpgradableRoundTripper
 
 	// ProxyConnectHeader optionally specifies headers to send to
 	// proxies during CONNECT requests.
@@ -543,21 +544,20 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 
 			if resp.StatusCode == StatusSwitchingProtocols {
 				fmt.Println("Switching protocols, here goes nothing!")
-				// TODO(gerg): Just because we are switching protocol doesn't mean we are going to h2c
-				// don't forget websockets
-				// TODO(gerg): TLSNextProto might not have a "h2c" key
-				h2cUpgrade := t.TLSNextProto["h2c"]
-				conn := pconn.conn.(*tls.Conn)
-				authority := cm.targetAddr
-				// TODO(gerg): We now have a pconn that has an alt defined (to a http2.Transport) AND
-				// it is running a readloop (unless it was terminated already as part of processing the 101?)
-				// are we going to run into issues with them fighting over the connection?
-				// Good news is the pconn readLoop seems to handle the 101 case as terminal and intentionally
-				// leaves the connection open for reading/writing in the upgraded protocol
-				pconn.alt = h2cUpgrade(authority, conn) // fn defined in h2_bundle http2configureTransport
-				fmt.Println("Upgraded connection to HTTP/2, now to read the response...")
-				resp, err = pconn.alt.RoundTrip(req) // pconn.alt is t3 which is a http2.PremiumRoundTripper
-				fmt.Println("We did it! HTTP/2 response recovered!")
+				upgradeProto := resp.Header.Get("Upgrade")
+				if upgradeFn, ok := t.UpgradeNextProto[upgradeProto]; ok {
+					t2 := upgradeFn(cm.targetAddr, pconn.conn.(*tls.Conn))
+					fmt.Println("Upgraded connection to HTTP/2, now to read the response...")
+					// TODO(gerg): We now have a pconn that has an alt defined (to a http2.Transport) AND
+					// it is running a readloop (unless it was terminated already as part of processing the 101?)
+					// are we going to run into issues with them fighting over the connection?
+					// Good news is the pconn readLoop seems to handle the 101 case as terminal and intentionally
+					// leaves the connection open for reading/writing in the upgraded protocol
+					// pconn.alt = h2cUpgrade(authority, conn) // fn defined in h2_bundle http2configureTransport
+					pconn.alt = t2
+					resp, err = t2.CompleteUpgrade(req)
+					fmt.Println("We did it! HTTP/2 response recovered!")
+				}
 			}
 		}
 		if err == nil {

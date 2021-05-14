@@ -816,36 +816,6 @@ func (c *http2dialCall) dial(addr string) {
 	c.p.mu.Unlock()
 }
 
-// TODO(greg): This is basically a copy of addConnIfNeeded, can it be merged back in?
-func (p *http2clientConnPool) upgradeHttp1Conn(key string, t *http2Transport, c *tls.Conn) (used bool, err error) {
-	p.mu.Lock()
-	for _, cc := range p.conns[key] {
-		if cc.CanTakeNewRequest() {
-			p.mu.Unlock()
-			return false, nil
-		}
-	}
-	call, dup := p.addConnCalls[key]
-	if !dup {
-		if p.addConnCalls == nil {
-			p.addConnCalls = make(map[string]*http2addConnCall)
-		}
-		call = &http2addConnCall{
-			p:    p,
-			done: make(chan struct{}),
-		}
-		p.addConnCalls[key] = call
-		go call.run(t, key, c, true)
-	}
-	p.mu.Unlock()
-
-	<-call.done
-	if call.err != nil {
-		return false, call.err
-	}
-	return !dup, nil
-}
-
 // addConnIfNeeded makes a NewClientConn out of c if a connection for key doesn't
 // already exist. It coalesces concurrent calls with the same key.
 // This is used by the http1 Transport code when it creates a new connection. Because
@@ -854,7 +824,7 @@ func (p *http2clientConnPool) upgradeHttp1Conn(key string, t *http2Transport, c 
 // This code decides which ones live or die.
 // The return value used is whether c was used.
 // c is never closed.
-func (p *http2clientConnPool) addConnIfNeeded(key string, t *http2Transport, c *tls.Conn) (used bool, err error) {
+func (p *http2clientConnPool) addConnIfNeeded(key string, t *http2Transport, c *tls.Conn, createStreamPlz bool) (used bool, err error) {
 	p.mu.Lock()
 	for _, cc := range p.conns[key] {
 		if cc.CanTakeNewRequest() {
@@ -872,7 +842,7 @@ func (p *http2clientConnPool) addConnIfNeeded(key string, t *http2Transport, c *
 			done: make(chan struct{}),
 		}
 		p.addConnCalls[key] = call
-		go call.run(t, key, c, false)
+		go call.run(t, key, c, createStreamPlz)
 	}
 	p.mu.Unlock()
 
@@ -6671,6 +6641,11 @@ func (t3 *PremiumRoundTripper) RoundTrip(req *Request) (*Response, error) {
 	return t3.t2.CompleteUpgrade(req)
 }
 
+type UpgradableRoundTripper interface {
+	RoundTripper
+	CompleteUpgrade(*Request) (*Response, error)
+}
+
 func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 	connPool := new(http2clientConnPool)
 	t2 := &http2Transport{
@@ -6692,7 +6667,7 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 	}
 	alpnUpgradeFn := func(authority string, c *tls.Conn) RoundTripper {
 		addr := http2authorityAddr("https", authority)
-		if used, err := connPool.addConnIfNeeded(addr, t2, c); err != nil {
+		if used, err := connPool.addConnIfNeeded(addr, t2, c, false); err != nil {
 			go c.Close()
 			return http2erringRoundTripper{err}
 		} else if !used {
@@ -6704,12 +6679,14 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 		}
 		return t2
 	}
-	h2cUpgradeFn := func(authority string, c *tls.Conn) RoundTripper {
-		fmt.Println("Upgrading to h2c via h2cUpgradeFn")
+
+	fmt.Println("Registering proto callbacks!")
+	h2cUpgradeFn := func(authority string, c *tls.Conn) UpgradableRoundTripper {
 		addr := http2authorityAddr("https", authority)
-		if used, err := connPool.upgradeHttp1Conn(addr, t2, c); err != nil {
+		if used, err := connPool.addConnIfNeeded(addr, t2, c, true); err != nil {
 			go c.Close()
-			return http2erringRoundTripper{err}
+			//TODO(gerg): return a proper error here instead of nil. http2erringUpgradableRoundTripper?
+			return nil //http2erringRoundTripper{err}
 		} else if !used {
 			// Turns out we don't need this c.
 			// For example, two goroutines made requests to the same host
@@ -6717,7 +6694,7 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 			// was unknown)
 			go c.Close()
 		}
-		return &PremiumRoundTripper{t2: t2}
+		return t2
 	}
 
 	// TODO(gerg): Okay, this is cheating. "h2c" is not a valid ALPN protocol. If
@@ -6726,11 +6703,16 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 	// get this callback to t1.
 	if m := t1.TLSNextProto; len(m) == 0 {
 		t1.TLSNextProto = map[string]func(string, *tls.Conn) RoundTripper{
-			"h2":  alpnUpgradeFn,
-			"h2c": h2cUpgradeFn,
+			"h2": alpnUpgradeFn,
 		}
 	} else {
 		m["h2"] = alpnUpgradeFn
+	}
+	if m := t1.UpgradeNextProto; len(m) == 0 {
+		t1.UpgradeNextProto = map[string]func(string, *tls.Conn) UpgradableRoundTripper{
+			"h2c": h2cUpgradeFn,
+		}
+	} else {
 		m["h2c"] = h2cUpgradeFn
 	}
 	fmt.Println("Registered the h2c upgrade function in t1.TLSNextProto")
