@@ -6672,8 +6672,6 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 		return t2
 	}
 
-	//TODO(gerg): should this live in the h2c package?
-	fmt.Println("Registering proto callbacks!")
 	h2cUpgradeFn := func(authority string, c *tls.Conn) upgradableRoundTripper {
 		addr := http2authorityAddr("https", authority)
 		if used, err := connPool.addConnIfNeeded(addr, t2, c, true); err != nil {
@@ -6703,7 +6701,6 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 	} else {
 		m["h2c"] = h2cUpgradeFn
 	}
-	fmt.Println("Registered the h2c upgrade function in t1.TLSNextProto")
 	return t2, nil
 }
 

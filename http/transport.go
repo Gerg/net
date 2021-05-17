@@ -327,7 +327,6 @@ type h2Transport interface {
 // onceSetNextProtoDefaults initializes TLSNextProto.
 // It must be called via t.nextProtoOnce.Do.
 func (t *Transport) onceSetNextProtoDefaults() {
-	fmt.Println("Once, considering whether to set up HTTP/2 transport! Hmm......")
 	t.tlsNextProtoWasNil = (t.TLSNextProto == nil)
 	if strings.Contains(os.Getenv("GODEBUG"), "http2client=0") {
 		return
@@ -362,7 +361,6 @@ func (t *Transport) onceSetNextProtoDefaults() {
 		// However, if ForceAttemptHTTP2 is true, it overrides the above checks.
 		return
 	}
-	fmt.Println("Configuring HTTP/2 transport!")
 	t2, err := http2configureTransport(t)
 	if err != nil {
 		log.Printf("Error enabling Transport HTTP/2 support: %v", err)
@@ -456,7 +454,6 @@ func (t *Transport) useRegisteredProtocol(req *Request) bool {
 
 // roundTrip implements a RoundTripper over HTTP.
 func (t *Transport) roundTrip(req *Request) (*Response, error) {
-	fmt.Println("!!!!! Golang successfully modified. Alert the authority. !!!!!!")
 	t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
 	ctx := req.Context()
 	trace := httptrace.ContextClientTrace(ctx)
