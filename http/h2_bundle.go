@@ -864,7 +864,7 @@ func (c *http2addConnCall) run(t *http2Transport, key string, tc *tls.Conn, crea
 	var err error
 
 	if createStream {
-		cc, err = t.NewClientConnWithStream(tc)
+		cc, err = t.newClientConnWithStream(tc)
 	} else {
 		cc, err = t.NewClientConn(tc)
 	}
@@ -6633,17 +6633,9 @@ func http2ConfigureTransport(t1 *Transport) error {
 	return err
 }
 
-type PremiumRoundTripper struct {
-	t2 *http2Transport
-}
-
-func (t3 *PremiumRoundTripper) RoundTrip(req *Request) (*Response, error) {
-	return t3.t2.CompleteUpgrade(req)
-}
-
 type UpgradableRoundTripper interface {
 	RoundTripper
-	CompleteUpgrade(*Request) (*Response, error)
+	completeUpgrade(*Request) (*Response, error)
 }
 
 func http2configureTransport(t1 *Transport) (*http2Transport, error) {
@@ -6943,7 +6935,7 @@ func (t *http2Transport) RoundTrip(req *Request) (*Response, error) {
 	return t.RoundTripOpt(req, http2RoundTripOpt{})
 }
 
-func (t *http2Transport) CompleteUpgrade(req *Request) (*Response, error) {
+func (t *http2Transport) completeUpgrade(req *Request) (*Response, error) {
 	addr := http2authorityAddr(req.URL.Scheme, req.URL.Host)
 	cc, err := t.connPool().GetClientConn(req, addr)
 	if err != nil {
@@ -6954,7 +6946,7 @@ func (t *http2Transport) CompleteUpgrade(req *Request) (*Response, error) {
 	http2traceGotConn(req, cc, reused)
 	res, err := cc.completeUpgrade(req)
 	if err != nil {
-		t.vlogf("CompleteUpgrade failure: %v", err)
+		t.vlogf("completeUpgrade failure: %v", err)
 		return nil, err
 	}
 	return res, nil
@@ -7159,8 +7151,7 @@ func (t *http2Transport) NewClientConn(c net.Conn) (*http2ClientConn, error) {
 	return t.newClientConn(c, false, false)
 }
 
-// TODO(gerg): Do we want to add a new public method here?
-func (t *http2Transport) NewClientConnWithStream(c net.Conn) (*http2ClientConn, error) {
+func (t *http2Transport) newClientConnWithStream(c net.Conn) (*http2ClientConn, error) {
 	return t.newClientConn(c, false, true)
 }
 
@@ -7617,9 +7608,7 @@ func (cc *http2ClientConn) roundTrip(req *Request) (res *Response, gotErrAfterRe
 	return cc.returnTrip(req, cs, bodyWriter, hasBody)
 }
 
-// TODO(gerg): Method signature, use new struct?
 func (cc *http2ClientConn) returnTrip(req *Request, cs *http2clientStream, bodyWriter http2bodyWriterState, hasBody bool) (res *Response, gotErrAfterReqBodyWrite bool, err error) {
-
 	var respHeaderTimer <-chan time.Time
 	if hasBody && !bodyWriter.written {
 		bodyWriter.scheduleBodyWrite()
@@ -7663,7 +7652,6 @@ func (cc *http2ClientConn) returnTrip(req *Request, cs *http2clientStream, bodyW
 		select {
 		case re := <-readLoopResCh:
 			return handleReadLoopResponse(re)
-			// TODO(gerg): Understand what publishes to this channel
 		case <-respHeaderTimer:
 			if !hasBody || bodyWriter.written {
 				cc.writeStreamReset(cs.ID, http2ErrCodeCancel, nil)
@@ -8985,7 +8973,7 @@ func http2strSliceContains(ss []string, s string) bool {
 type http2erringRoundTripper struct{ err error }
 
 func (rt http2erringRoundTripper) RoundTrip(*Request) (*Response, error)       { return nil, rt.err }
-func (rt http2erringRoundTripper) CompleteUpgrade(*Request) (*Response, error) { return nil, rt.err }
+func (rt http2erringRoundTripper) completeUpgrade(*Request) (*Response, error) { return nil, rt.err }
 
 // gzipReader wraps a response body so it can lazily
 // call gzip.NewReader on the first call to Read
