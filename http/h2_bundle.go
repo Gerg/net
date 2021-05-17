@@ -6633,7 +6633,7 @@ func http2ConfigureTransport(t1 *Transport) error {
 	return err
 }
 
-type UpgradableRoundTripper interface {
+type upgradableRoundTripper interface {
 	RoundTripper
 	completeUpgrade(*Request) (*Response, error)
 }
@@ -6674,7 +6674,7 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 
 	//TODO(gerg): should this live in the h2c package?
 	fmt.Println("Registering proto callbacks!")
-	h2cUpgradeFn := func(authority string, c *tls.Conn) UpgradableRoundTripper {
+	h2cUpgradeFn := func(authority string, c *tls.Conn) upgradableRoundTripper {
 		addr := http2authorityAddr("https", authority)
 		if used, err := connPool.addConnIfNeeded(addr, t2, c, true); err != nil {
 			go c.Close()
@@ -6696,8 +6696,8 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 	} else {
 		m["h2"] = alpnUpgradeFn
 	}
-	if m := t1.UpgradeNextProto; len(m) == 0 {
-		t1.UpgradeNextProto = map[string]func(string, *tls.Conn) UpgradableRoundTripper{
+	if m := t1.upgradeNextProto; len(m) == 0 {
+		t1.upgradeNextProto = map[string]func(string, *tls.Conn) upgradableRoundTripper{
 			"h2c": h2cUpgradeFn,
 		}
 	} else {
