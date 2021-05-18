@@ -824,7 +824,7 @@ func (c *http2dialCall) dial(addr string) {
 // This code decides which ones live or die.
 // The return value used is whether c was used.
 // c is never closed.
-func (p *http2clientConnPool) addConnIfNeeded(key string, t *http2Transport, c *tls.Conn, createStream bool) (used bool, err error) {
+func (p *http2clientConnPool) addConnIfNeeded(key string, t *http2Transport, c net.Conn, createStream bool) (used bool, err error) {
 	p.mu.Lock()
 	for _, cc := range p.conns[key] {
 		if cc.CanTakeNewRequest() {
@@ -859,7 +859,7 @@ type http2addConnCall struct {
 	err  error
 }
 
-func (c *http2addConnCall) run(t *http2Transport, key string, tc *tls.Conn, createStream bool) {
+func (c *http2addConnCall) run(t *http2Transport, key string, tc net.Conn, createStream bool) {
 	var cc *http2ClientConn
 	var err error
 
@@ -6672,7 +6672,7 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 		return t2
 	}
 
-	h2cUpgradeFn := func(authority string, c *tls.Conn) upgradableRoundTripper {
+	h2cUpgradeFn := func(authority string, c net.Conn) upgradableRoundTripper {
 		addr := http2authorityAddr("https", authority)
 		if used, err := connPool.addConnIfNeeded(addr, t2, c, true); err != nil {
 			go c.Close()
@@ -6695,7 +6695,7 @@ func http2configureTransport(t1 *Transport) (*http2Transport, error) {
 		m["h2"] = alpnUpgradeFn
 	}
 	if m := t1.upgradeNextProto; len(m) == 0 {
-		t1.upgradeNextProto = map[string]func(string, *tls.Conn) upgradableRoundTripper{
+		t1.upgradeNextProto = map[string]func(string, net.Conn) upgradableRoundTripper{
 			"h2c": h2cUpgradeFn,
 		}
 	} else {

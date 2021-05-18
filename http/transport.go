@@ -256,7 +256,7 @@ type Transport struct {
 	nextProtoOnce      sync.Once
 	h2transport        h2Transport // non-nil if http2 wired up
 	tlsNextProtoWasNil bool        // whether TLSNextProto was nil when the Once fired
-	upgradeNextProto   map[string]func(string, *tls.Conn) upgradableRoundTripper
+	upgradeNextProto   map[string]func(string, net.Conn) upgradableRoundTripper
 
 	// ForceAttemptHTTP2 controls whether HTTP/2 is enabled when a non-zero
 	// Dial, DialTLS, or DialContext func or TLSClientConfig is provided.
@@ -538,7 +538,7 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 			if err == nil && resp.isProtocolSwitch() {
 				upgradeProto := resp.Header.Get("Upgrade")
 				if upgradeFn, ok := t.upgradeNextProto[upgradeProto]; ok {
-					t2 := upgradeFn(cm.targetAddr, pconn.conn.(*tls.Conn))
+					t2 := upgradeFn(cm.targetAddr, pconn.conn)
 					pconn.alt = t2
 					resp, err = t2.completeUpgrade(req)
 				}
